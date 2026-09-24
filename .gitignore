@@ -1,0 +1,6 @@
+*.png
+__pycache__/
+*.pyc
+*.yml
+*.yaml
+.DS_Store
