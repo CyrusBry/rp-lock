@@ -324,6 +324,19 @@ def cmd_shell():
         print(f"{duration*1e3:.0f} ms of error: RMS = {np.std(err):.4f}  mean = {np.mean(err):+.4f}  "
               f"peak = {np.max(np.abs(err)):.4f}  fringe A = {a:.4f}  "
               f"samples beyond 0.7 A = {100*frac:.1f} %  -> {'LOCKED' if frac < 0.02 else 'SLIPPING'}")
+        # fringe-crossing rate: 2 zero crossings per fringe; one fringe = FRINGE_HZ of laser tuning
+        e0 = err - np.mean(err)
+        nx = int(np.sum(np.abs(np.diff(np.sign(e0))) > 0))
+        rate = nx / 2.0 / duration
+        print(f"zero crossings: {nx}  -> {rate/1e3:.2f} kfringes/s  = {rate*FRINGE_HZ/1e9:.3f} GHz/s of frequency slew (if monotonic)")
+        # dominant spectral line of the error (an NCO/beat OFFSET shows as one tone carrying most of the power)
+        X = np.abs(np.fft.rfft(e0 * np.hanning(len(e0)))) ** 2
+        f = np.fft.rfftfreq(len(e0), d=duration / len(e0))
+        X[0] = 0.0
+        k = int(np.argmax(X))
+        band = X[max(k-2, 0):k+3].sum() / max(X.sum(), 1e-30)
+        print(f"dominant tone: {f[k]/1e3:.2f} kHz carrying {100*band:.0f} % of the error power  "
+              f"({'single tone -> beat/NCO offset?' if band > 0.5 else 'broadband -> real noise'})")
         try:
             import matplotlib; matplotlib.use('Agg')
             import matplotlib.pyplot as plt
