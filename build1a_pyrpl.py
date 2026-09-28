@@ -314,10 +314,13 @@ def cmd_shell():
         print(f"fringe: max {np.nanmax(err):+.4f}  min {np.nanmin(err):+.4f}  ampl {ampl:.4f}   "
               f"(unlocked RMS = {ampl/np.sqrt(2):.4f}; status() reports suppression against this)")
 
-    def errscope(duration=0.02, save='errscope.png'):
+    def errscope(duration=0.02, save=None):
         """Time-domain look at the raw error: LOCKED = flat noisy line near 0 (all samples well
         inside +/-0.7 A); SLIPPING = sinusoids sweeping the full +/-A. Prints the slip fraction and
         saves a plot. Read-only."""
+        if save is None:   # never overwrite: errscope_HHMMSS_<open|closed>_pX_iY.png
+            state = 'closed' if pid.output_direct == 'out1' else 'open'
+            save = f"errscope_{time.strftime('%H%M%S')}_{state}_p{pid.p:.2e}_i{pid.i:.3g}.png"
         err, out = scope_curve(rp, duration=duration)
         a = LAST_FRINGE['ampl'] or float(np.max(np.abs(err)))
         frac = float(np.mean(np.abs(err) > 0.7 * a))
