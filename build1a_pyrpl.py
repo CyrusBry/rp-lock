@@ -352,8 +352,15 @@ def cmd_shell():
             print(f"(no plot: {ex})")
 
     def lock(pgain=None, ihz=None):
-        pg = P_START if pgain is None else pgain
-        ih = I_UNITY_HZ if ihz is None else ihz
+        """P_START / I_UNITY_HZ assume a 0.16 V fringe. Scale both by 0.16/A from the last sweep()
+        so L_P and the crossover stay at their design values whatever the visibility (A = 0.40
+        after re-peaking the paddles on 2026-09-28 would otherwise put the crossover at ~30 kHz)."""
+        a = LAST_FRINGE['ampl']
+        scale = (0.16 / a) if a else 1.0
+        if a and abs(scale - 1) > 0.2:
+            print(f"fringe A = {a:.3f} (design 0.16): scaling P and I by {scale:.2f}")
+        pg = P_START * scale if pgain is None else pgain
+        ih = I_UNITY_HZ * scale if ihz is None else ihz
         setup_drive_and_demod(rp)
         setup_pid(rp, p=pg, i=0.0)
         pid.output_direct = 'out1'
@@ -368,8 +375,11 @@ def cmd_shell():
         """change the integrator on the fly (loop stays closed). Capped at I_MAX_HZ: through the
         100:1 plant gain, I = 25 Hz is already a ~12 kHz crossover; 100 Hz hits the delay line's
         -180 deg point (51 kHz) and the loop rings, slips fringes and the integrator ramps to a rail."""
-        if ihz > I_MAX_HZ:
-            print(f"seti({ihz}) refused: cap is {I_MAX_HZ:g} Hz (crossover ~{ihz * 0.16 * 6.16e-5 * K_ACT_OUT1 / 1e3:.0f} kHz)")
+        a = LAST_FRINGE['ampl']
+        cap = I_MAX_HZ * ((0.16 / a) if a else 1.0)
+        if ihz > cap:
+            print(f"seti({ihz}) refused: cap is {cap:.3g} Hz for fringe A = {a or 0.16:.3f} "
+                  f"(crossover ~{ihz * (a or 0.16) * 6.16e-5 * K_ACT_OUT1 / 1e3:.0f} kHz)")
             return
         pid.i = ihz; time.sleep(1.0); status()
 
