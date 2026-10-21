@@ -6,9 +6,9 @@ Build 1A: PLANEX self-heterodyne delay-line lock closed with a Red Pitaya
 Signal chain (UCLA Build.pdf, Fig. 2):
     OUT2  -> low-pass -> ~20 dB pad -> ZX60-100VH+ -> AOM      (40 MHz drive)
     IN1   <- PDA05CF2 (SM1FCA, VOA) -> BLP-100+ -> DC block -> tee + 50 ohm
-    OUT1  -> 4.7 kohm series -> tee + 50 ohm terminator -> CLD1015 Mod In   (100:1, as built 2026-09-23)
-             Direct drive was tried 2026-09-22 and is impossible: the required P (5e-6) is below the
-             PID register floor (2.44e-4). 47 kohm (1000:1) locks but rails at +/-5 MHz. -> DIVIDER below.
+    OUT1  -> Koheron CTL200-2-B-200 DC modulation input (1.25 mA/V setting)     (DRIVER = "CTL200", from 2026-09-29)
+             History: CLD1015 Mod In through a 4.7 kohm 100:1 divider (2026-09-23..28); its 5-10 uA RMS current
+             noise (150-300 kHz RMS on the PLANEX) made the fringe unresolvable -> replaced. See DRIVER below.
 
 The IQ module both GENERATES the 40 MHz drive (its own output on OUT2) and
 DEMODULATES the beat on IN1 against the same NCO, so drive phase noise is
@@ -47,16 +47,26 @@ IQ_QFACTOR   = 2.7                # [-]   bench 2026-09-22 (PDA05CF2 via VOA): f
 # DIVIDER = 1.0   : OUT1 straight into the Mod In (through a tee + 50 ohm terminator)
 # DIVIDER = 0.01  : 4.7 kohm series + 50 ohm shunt at the Mod In (100:1)
 # DIVIDER = 0.001 : 47 kohm series + 50 ohm shunt at the Mod In (1000:1, the first-fringe setup; +/-5 MHz range)
-DIVIDER      = 0.01               # as built 2026-09-23: 4.7 kohm series, 50 ohm shunt -> 1:95, +/-53 MHz at +/-1 V, 8 LSB per fringe
-K_ACT_MODIN  = 5.0e9              # [Hz/V] at the Mod In (measured; refine with 'calib')
-K_ACT_OUT1   = K_ACT_MODIN * DIVIDER   # [Hz/V] referred to OUT1: 5 GHz/V direct, 50 MHz/V with 100:1
+# ---- which current driver holds the PLANEX ----------------------------
+# "CLD1015": Thorlabs CLD1015, Mod In 150 mA/V -> 5 GHz/V; needs the 4.7 kohm 100:1 divider (DIVIDER = 0.01).
+#            Its 5-10 uA RMS current noise stopped the lock (UCLA Build.pdf sec. 3.5) -> retired 2026-09-29.
+# "CTL200" : Koheron CTL200-2-B-200, DC modulation input 50 ohm, gain setting M = 1.25 mA/V -> 37.5 MHz/V.
+#            OUT1 goes straight in (DIVIDER = 1.0): +/-1 V = +/-37.5 MHz, one fringe = 2.7 mV = 11 LSB.
+#            Set the gain to M in the CTL200 (serial: see its manual) before trusting these numbers,
+#            then re-measure K_ACT with 'calib'.
+DRIVER       = "CTL200"
+K_MA_PER_V   = {"CLD1015": 150.0, "CTL200": 1.25}[DRIVER]    # [mA/V] modulation-input coefficient
+K_HZ_PER_MA  = 30.0e6             # [Hz/mA] PLANEX tuning, measured 2026-09-16 by fringe counting
+DIVIDER      = {"CLD1015": 0.01, "CTL200": 1.0}[DRIVER]      # external divider between OUT1 and the driver
+K_ACT_MODIN  = K_HZ_PER_MA * K_MA_PER_V   # [Hz/V] at the driver input: 5 GHz/V (CLD1015), 37.5 MHz/V (CTL200)
+K_ACT_OUT1   = K_ACT_MODIN * DIVIDER      # [Hz/V] referred to OUT1
 
 FRINGE_HZ    = 102.0e3            # [Hz]  1/tau_d for the 2 km spool (tau_d = 9.8 us)
-I_MAX_HZ     = 40.0               # [Hz]  hard cap for seti(): I = 25 Hz already puts the crossover at ~12 kHz through the
+I_MAX_HZ     = 12.5e3 * 1.6 / (0.16 * 6.16e-5 * K_ACT_OUT1)   # [Hz] seti() cap = 20 kHz crossover (40 Hz at 100:1 CLD1015, 54 Hz on the CTL200). I = 25/34 Hz is already ~12 kHz through the
                                   #       100:1 plant gain (~500). I = 100 Hz -> 50 kHz = the delay line's -180 deg point.
 LAST_FRINGE  = {'ampl': None}     # set by sweep(); status() reports suppression against ampl/sqrt(2)
 
-OUT1_LIMIT   = 0.1 if DIVIDER >= 0.5 else 1.0   # [V] clamp: +/-0.1 V direct = +/-15 mA (laser stays lit); +/-1 V with the divider
+OUT1_LIMIT   = 0.1 if K_ACT_OUT1 > 1e9 else 1.0  # [V] clamp: +/-0.1 V if the actuator is GHz/V-class (CLD1015 direct); +/-1 V otherwise
 
 SWEEP_FREQ   = 10.0               # [Hz]  open-loop sweep on OUT1 (through the divider = a few fringes)
 SWEEP_AMPL   = 3.0e6 / K_ACT_OUT1 # [V]   ~3 MHz peak = ~30 fringes each way (0.6 mV direct = 2.5 LSB!, 60 mV with 100:1)
