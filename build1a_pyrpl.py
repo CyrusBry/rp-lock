@@ -6,7 +6,8 @@ Build 1A: PLANEX self-heterodyne delay-line lock closed with a Red Pitaya
 Signal chain (UCLA Build.pdf, Fig. 2):
     OUT2  -> low-pass -> ~20 dB pad -> ZX60-100VH+ -> AOM      (40 MHz drive)
     IN1   <- PDA05CF2 (SM1FCA, VOA) -> BLP-100+ -> DC block -> tee + 50 ohm
-    OUT1  -> Koheron CTL200-2-B-200 DC modulation input (1.25 mA/V setting)     (DRIVER = "CTL200", from 2026-09-29)
+    OUT1  -> Koheron CTL200-2-B-200 DC modulation input (jumper M)              (DRIVER = "CTL200", from 2026-09-29)
+             Measured 2026-10-21 by calib: 125 MHz/V referred to OUT1 (first held lock the same day).
              History: CLD1015 Mod In through a 4.7 kohm 100:1 divider (2026-09-23..28); its 5-10 uA RMS current
              noise (150-300 kHz RMS on the PLANEX) made the fringe unresolvable -> replaced. See DRIVER below.
 
@@ -22,6 +23,7 @@ Usage:
     python build1a_pyrpl.py status      # print module settings + error/servo RMS
     python build1a_pyrpl.py calib       # measure actuator gain [MHz/V at OUT1] by fringe counting
     python build1a_pyrpl.py shell       # ONE persistent connection: status()/lock()/seti()/unlock() at a prompt (preferred for tuning)
+                                        # slowloop('COM6') in the shell = TEC slow loop over the CTL200 serial port
 
 Edit HOSTNAME and the LEVELS block below before the first run.
 """
@@ -50,12 +52,12 @@ IQ_QFACTOR   = 2.7                # [-]   bench 2026-09-22 (PDA05CF2 via VOA): f
 # ---- which current driver holds the PLANEX ----------------------------
 # "CLD1015": Thorlabs CLD1015, Mod In 150 mA/V -> 5 GHz/V; needs the 4.7 kohm 100:1 divider (DIVIDER = 0.01).
 #            Its 5-10 uA RMS current noise stopped the lock (UCLA Build.pdf sec. 3.5) -> retired 2026-09-29.
-# "CTL200" : Koheron CTL200-2-B-200, DC modulation input 50 ohm, gain setting M = 1.25 mA/V -> 37.5 MHz/V.
-#            OUT1 goes straight in (DIVIDER = 1.0): +/-1 V = +/-37.5 MHz, one fringe = 2.7 mV = 11 LSB.
-#            Set the gain to M in the CTL200 (serial: see its manual) before trusting these numbers,
-#            then re-measure K_ACT with 'calib'.
+# "CTL200" : Koheron CTL200-2-B-200, DC modulation SMA, gain JUMPER = M (nominal 2.5 mA/V per the user guide).
+#            MEASURED 2026-10-21 (calib, 0.5 V and 1.0 V sweeps): 121-130 MHz/V referred to OUT1 -> 4.17 mA/V
+#            effective (RP open-circuit swing and/or PLANEX > 30 MHz/mA). +/-1 V = +/-125 MHz, one fringe = 0.82 mV
+#            = 6.7 LSB. P_START lands below the PyRPL P floor (2.44e-4) and is raised to it: L_P = 0.44.
 DRIVER       = "CTL200"
-K_MA_PER_V   = {"CLD1015": 150.0, "CTL200": 1.25}[DRIVER]    # [mA/V] modulation-input coefficient
+K_MA_PER_V   = {"CLD1015": 150.0, "CTL200": 4.17}[DRIVER]    # [mA/V] modulation-input coefficient (CTL200: measured, see above)
 K_HZ_PER_MA  = 30.0e6             # [Hz/mA] PLANEX tuning, measured 2026-09-16 by fringe counting
 DIVIDER      = {"CLD1015": 0.01, "CTL200": 1.0}[DRIVER]      # external divider between OUT1 and the driver
 K_ACT_MODIN  = K_HZ_PER_MA * K_MA_PER_V   # [Hz/V] at the driver input: 5 GHz/V (CLD1015), 37.5 MHz/V (CTL200)
@@ -75,7 +77,8 @@ SWEEP_AMPL   = 3.0e6 / K_ACT_OUT1 # [V]   ~3 MHz peak = ~30 fringes each way (0.
 # A flat proportional loop through 9.8 us of delay cannot exceed |L| ~ 2, so P
 # only supplies ~0.25 of loop gain and the integrator does the holding.
 # Loop gain L_P = P * K_d * 2*pi*tau_d * K_ACT_OUT1 ~ P * 0.16 * 6.2e-5 * K_ACT_OUT1  (= 5e4*P direct, 500*P with 100:1)
-P_START      = 0.25 / (0.16 * 6.16e-5 * K_ACT_OUT1)   # L_P ~ 0.25  (5e-6 direct, 5e-4 with 100:1)
+P_FLOOR      = 2.0 ** -12         # PyRPL pid.p register resolution (2.44e-4); smaller values round to 0 = no lock
+P_START      = max(0.25 / (0.16 * 6.16e-5 * K_ACT_OUT1), P_FLOOR)   # L_P ~ 0.25 (5e-4 with 100:1); floor-limited on the CTL200 (L_P = 0.44)
 P_STEPS      = []                 # empty = close at P_START and go straight to the integrator
 I_UNITY_HZ   = 12.5e3 / (0.16 * 6.16e-5 * K_ACT_OUT1)  # [Hz] crossover ~12 kHz  (0.25 Hz direct, 25 Hz with 100:1). Raise to broadening, back off 30 %
 
@@ -310,7 +313,7 @@ def cmd_shell():
             line += f"   suppression = {20*np.log10(unl / max(e_lf, 1e-6)):+.1f} dB (vs. unlocked {unl:.4f})"
         print(line)
         if abs(pid.ival) > 0.95 * OUT1_LIMIT and pid.output_direct == 'out1':
-            print("   ** OUT1 at the rail: integrator wound up -> recenter() (and nudge the CLD1015 TEC set point)")
+            print("   ** OUT1 at the rail: integrator wound up -> recenter(), then slowloop('COM6') to hold it there")
 
     def unlock():
         safe_outputs(rp)
@@ -333,15 +336,23 @@ def cmd_shell():
             save = f"errscope_{time.strftime('%H%M%S')}_{state}_p{pid.p:.2e}_i{pid.i:.3g}.png"
         err, out = scope_curve(rp, duration=duration)
         a = LAST_FRINGE['ampl'] or float(np.max(np.abs(err)))
-        frac = float(np.mean(np.abs(err) > 0.7 * a))
-        print(f"{duration*1e3:.0f} ms of error: RMS = {np.std(err):.4f}  mean = {np.mean(err):+.4f}  "
-              f"peak = {np.max(np.abs(err)):.4f}  fringe A = {a:.4f}  "
-              f"samples beyond 0.7 A = {100*frac:.1f} %  -> {'LOCKED' if frac < 0.02 else 'SLIPPING'}")
-        # fringe-crossing rate: 2 zero crossings per fringe; one fringe = FRINGE_HZ of laser tuning
         e0 = err - np.mean(err)
-        nx = int(np.sum(np.abs(np.diff(np.sign(e0))) > 0))
-        rate = nx / 2.0 / duration
-        print(f"zero crossings: {nx}  -> {rate/1e3:.2f} kfringes/s  = {rate*FRINGE_HZ/1e9:.3f} GHz/s of frequency slew (if monotonic)")
+        # fringe crossings with hysteresis (Schmitt at +/-0.5 A): noise near zero no longer counts.
+        # one crossing = one fringe = FRINGE_HZ of laser tuning.
+        hi = e0 > 0.5 * a; lo = e0 < -0.5 * a
+        state, nx = 0, 0
+        for h, l in zip(hi, lo):
+            if h and state != 1:
+                nx += state == -1; state = 1
+            elif l and state != -1:
+                nx += state == 1; state = -1
+        rate = nx / duration
+        frac = float(np.mean(np.abs(err) > 0.7 * a))
+        verdict = 'LOCKED' if nx == 0 else f'SLIPPING ({nx} fringe hops)'
+        print(f"{duration*1e3:.0f} ms of error: RMS = {np.std(err):.4f}  mean = {np.mean(err):+.4f}  "
+              f"peak = {np.max(np.abs(err)):.4f}  fringe A = {a:.4f}  residual = {np.std(err)/a:.2f} rad RMS  "
+              f"samples beyond 0.7 A = {100*frac:.1f} %  -> {verdict}")
+        print(f"fringe hops (hysteresis +/-0.5 A): {nx}  -> {rate/1e3:.2f} kfringes/s  = {rate*FRINGE_HZ/1e6:.1f} MHz/s of frequency slew (if monotonic)")
         # dominant spectral line of the error (an NCO/beat OFFSET shows as one tone carrying most of the power)
         X = np.abs(np.fft.rfft(e0 * np.hanning(len(e0)))) ** 2
         f = np.fft.rfftfreq(len(e0), d=duration / len(e0))
@@ -372,7 +383,7 @@ def cmd_shell():
         scale = (0.16 / a) if a else 1.0
         if a and abs(scale - 1) > 0.2:
             print(f"fringe A = {a:.3f} (design 0.16): scaling P and I by {scale:.2f}")
-        pg = P_START * scale if pgain is None else pgain
+        pg = max(P_START * scale, P_FLOOR) if pgain is None else pgain   # never below the register floor
         ih = I_UNITY_HZ * scale if ihz is None else ihz
         setup_drive_and_demod(rp)
         setup_pid(rp, p=pg, i=0.0)
@@ -403,12 +414,56 @@ def cmd_shell():
         """zero the integrator (use right after a TEC nudge brought OUT1 back near 0)"""
         pid.ival = 0.0; time.sleep(0.5); status()
 
-    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  recenter()  errscope()  unlock()   "
+    def slowloop(port="COM6", minutes=60, period=10.0, gain=0.09, max_step=2.0, deadband=0.05,
+                 target=0.0, rt_window=(8000.0, 16000.0)):
+        """TEC slow loop: nudge the CTL200 thermistor set point (rtset, ohms) so the fast loop's
+        integrator (pid.ival = OUT1) stays near `target`. Measured 2026-10-21 on the PLANEX:
+        raising rtset by 1 ohm raises OUT1 by +0.09 V (= +11 MHz; ~5.5 GHz/K), so the step is
+        -(ival - target)/gain, 70 % per period, clipped to +/-max_step ohm (2 ohm = 22 MHz, which the
+        fast loop follows without a flicker; 10 ohm in one go dropped the lock on 2026-10-21).
+        Opens the CTL200 serial port itself: exit the ctl200.py shell first. Ctrl-C to stop.
+        Bench drift 2026-10-21 was +0.17 V/min = ~2 ohm/min of correction."""
+        import re as _re, serial
+        ser = serial.Serial(port, 115200, timeout=0.3)
+        def tx(cmdstr):
+            ser.reset_input_buffer(); ser.write((cmdstr + "\r\n").encode()); time.sleep(0.15)
+            return ser.read(ser.in_waiting or 1).decode(errors="replace")
+        def rt_read():
+            nums = _re.findall(r"[-+]?\d+\.\d+", tx("rtset"))
+            return float(nums[-1]) if nums else float("nan")
+        r = rt_read()
+        if not (rt_window[0] < r < rt_window[1]):
+            print(f"rtset reads {r} ohm -- outside {rt_window}; not touching it."); ser.close(); return
+        print(f"slow loop on {port}: rtset {r:.1f} ohm, target OUT1 {target:+.2f} V, gain {gain} V/ohm, "
+              f"max step {max_step} ohm, every {period:.0f} s for {minutes} min. Ctrl-C stops (set point stays).")
+        t0 = time.time()
+        try:
+            while time.time() - t0 < minutes * 60:
+                v = float(pid.ival)
+                if pid.output_direct != 'out1':
+                    print("loop is open -- slow loop idle"); time.sleep(period); continue
+                step = 0.0
+                if abs(v - target) > deadband:
+                    step = float(np.clip(-0.7 * (v - target) / gain, -max_step, max_step))
+                    r_new = r + step
+                    if rt_window[0] < r_new < rt_window[1]:
+                        tx(f"rtset {r_new:.1f}"); r = r_new
+                    else:
+                        print(f"refusing rtset {r_new:.1f}: outside window"); step = 0.0
+                flag = "  ** near rail: recenter()" if abs(v) > 0.9 * OUT1_LIMIT else ""
+                print(f"{time.strftime('%H:%M:%S')}  OUT1 {v:+.3f} V  rtset {r:8.1f} ohm  step {step:+.1f}{flag}")
+                time.sleep(period)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            print(f"slow loop stopped; rtset left at {r:.1f} ohm"); ser.close()
+
+    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  recenter()  errscope()  unlock()  slowloop('COM6')   "
               "rp/iq/pid are live objects.  Ctrl-Z Enter (Windows) or exit() to leave; the loop stays as you left it.\n"
               "Run sweep() once first so status() can report suppression [dB] against the fringe.")
     code.interact(banner=banner, local=dict(rp=rp, iq=iq, pid=pid, status=status, unlock=unlock, sweep=sweep,
                                              lock=lock, seti=seti, setp=setp, recenter=recenter, errscope=errscope,
-                                             np=np, time=time))
+                                             slowloop=slowloop, np=np, time=time))
 
 
 if __name__ == "__main__":
