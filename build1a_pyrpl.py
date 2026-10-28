@@ -491,8 +491,18 @@ def cmd_shell():
         """zero the integrator (use right after a TEC nudge brought OUT1 back near 0)"""
         pid.ival = 0.0; time.sleep(0.5); status()
 
-    def slowloop(port="COM6", minutes=60, period=10.0, gain=0.09, max_step=2.0, deadband=0.05,
-                 target=0.0, rt_window=(8000.0, 16000.0)):
+    SLOW = {'run': False, 'thread': None}
+
+    def slowstop():
+        """stop a background slowloop (set point stays where it is)"""
+        SLOW['run'] = False
+        t = SLOW['thread']
+        if t is not None and t.is_alive():
+            t.join(timeout=15)
+        print("slow loop stopped")
+
+    def slowloop(port="COM6", minutes=600, period=10.0, gain=0.09, max_step=2.0, deadband=0.05,
+                 target=0.0, rt_window=(8000.0, 16000.0), background=False):
         """TEC slow loop: nudge the CTL200 thermistor set point (rtset, ohms) so the fast loop's
         integrator (pid.ival = OUT1) stays near `target`. Measured 2026-10-21 on the PLANEX:
         raising rtset by 1 ohm raises OUT1 by +0.09 V (= +11 MHz; ~5.5 GHz/K), so the step is
@@ -500,48 +510,60 @@ def cmd_shell():
         fast loop follows without a flicker; 10 ohm in one go dropped the lock on 2026-10-21).
         Opens the CTL200 serial port itself: exit the ctl200.py shell first. Ctrl-C to stop.
         Bench drift 2026-10-21 was +0.17 V/min = ~2 ohm/min of correction.
-        With pii() on, OUT1 = pid0 output still carries the DC, so this loop needs no change."""
-        import re as _re, serial
-        ser = serial.Serial(port, 115200, timeout=0.3)
-        def tx(cmdstr):
-            ser.reset_input_buffer(); ser.write((cmdstr + "\r\n").encode()); time.sleep(0.15)
-            return ser.read(ser.in_waiting or 1).decode(errors="replace")
-        def rt_read():
-            nums = _re.findall(r"[-+]?\d+\.\d+", tx("rtset"))
-            return float(nums[-1]) if nums else float("nan")
-        r = rt_read()
-        if not (rt_window[0] < r < rt_window[1]):
-            print(f"rtset reads {r} ohm -- outside {rt_window}; not touching it."); ser.close(); return
-        print(f"slow loop on {port}: rtset {r:.1f} ohm, target OUT1 {target:+.2f} V, gain {gain} V/ohm, "
-              f"max step {max_step} ohm, every {period:.0f} s for {minutes} min. Ctrl-C stops (set point stays).")
-        t0 = time.time()
-        try:
-            while time.time() - t0 < minutes * 60:
-                v = float(pid.ival)
-                if pid.output_direct != 'out1':
-                    print("loop is open -- slow loop idle"); time.sleep(period); continue
-                step = 0.0
-                if abs(v - target) > deadband:
-                    step = float(np.clip(-0.7 * (v - target) / gain, -max_step, max_step))
-                    r_new = r + step
-                    if rt_window[0] < r_new < rt_window[1]:
-                        tx(f"rtset {r_new:.1f}"); r = r_new
-                    else:
-                        print(f"refusing rtset {r_new:.1f}: outside window"); step = 0.0
-                flag = "  ** near rail: recenter()" if abs(v) > 0.9 * OUT1_LIMIT else ""
-                print(f"{time.strftime('%H:%M:%S')}  OUT1 {v:+.3f} V  rtset {r:8.1f} ohm  step {step:+.1f}{flag}")
-                time.sleep(period)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            print(f"slow loop stopped; rtset left at {r:.1f} ohm"); ser.close()
+        With pii() on, OUT1 = pid0 output still carries the DC, so this loop needs no change.
+        background=True runs it in a thread so the prompt stays free for tuning; slowstop() ends it."""
+        def _run():
+            import re as _re, serial
+            ser = serial.Serial(port, 115200, timeout=0.3)
+            def tx(cmdstr):
+                ser.reset_input_buffer(); ser.write((cmdstr + "\r\n").encode()); time.sleep(0.15)
+                return ser.read(ser.in_waiting or 1).decode(errors="replace")
+            def rt_read():
+                nums = _re.findall(r"[-+]?\d+\.\d+", tx("rtset"))
+                return float(nums[-1]) if nums else float("nan")
+            r = rt_read()
+            if not (rt_window[0] < r < rt_window[1]):
+                print(f"rtset reads {r} ohm -- outside {rt_window}; not touching it."); ser.close(); return
+            print(f"slow loop on {port}: rtset {r:.1f} ohm, target OUT1 {target:+.2f} V, gain {gain} V/ohm, "
+                  f"max step {max_step} ohm, every {period:.0f} s for {minutes} min. Ctrl-C stops (set point stays).")
+            t0 = time.time()
+            try:
+                while SLOW['run'] and time.time() - t0 < minutes * 60:
+                    v = float(pid.ival)
+                    if pid.output_direct != 'out1':
+                        print("loop is open -- slow loop idle"); time.sleep(period); continue
+                    step = 0.0
+                    if abs(v - target) > deadband:
+                        step = float(np.clip(-0.7 * (v - target) / gain, -max_step, max_step))
+                        r_new = r + step
+                        if rt_window[0] < r_new < rt_window[1]:
+                            tx(f"rtset {r_new:.1f}"); r = r_new
+                        else:
+                            print(f"refusing rtset {r_new:.1f}: outside window"); step = 0.0
+                    flag = "  ** near rail: recenter()" if abs(v) > 0.9 * OUT1_LIMIT else ""
+                    if not background or step != 0.0 or flag:
+                        print(f"{time.strftime('%H:%M:%S')}  OUT1 {v:+.3f} V  rtset {r:8.1f} ohm  step {step:+.1f}{flag}")
+                    time.sleep(period)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                print(f"slow loop stopped; rtset left at {r:.1f} ohm"); ser.close()
+        import threading
+        if SLOW['thread'] is not None and SLOW['thread'].is_alive():
+            print("slow loop already running -- slowstop() first"); return
+        SLOW['run'] = True
+        if background:
+            SLOW['thread'] = threading.Thread(target=_run, daemon=True); SLOW['thread'].start()
+            print("slow loop running in the background (prints only when it steps); slowstop() to end")
+        else:
+            _run()
 
-    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  lead(fz)  pii(fz)  plant()  recenter()  errscope()  unlock()  slowloop('COM6')   "
+    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  lead(fz)  pii(fz)  plant()  recenter()  errscope()  unlock()  slowloop('COM6', background=True)  slowstop()   "
               "rp/iq/pid are live objects.  Ctrl-Z Enter (Windows) or exit() to leave; the loop stays as you left it.\n"
               "Run sweep() once first so status() can report suppression [dB] against the fringe.")
     code.interact(banner=banner, local=dict(rp=rp, iq=iq, pid=pid, status=status, unlock=unlock, sweep=sweep,
                                              lock=lock, seti=seti, setp=setp, recenter=recenter, errscope=errscope,
-                                             slowloop=slowloop, lead=lead, pii=pii, plant=plant, np=np, time=time))
+                                             slowloop=slowloop, slowstop=slowstop, lead=lead, pii=pii, plant=plant, np=np, time=time))
 
 
 if __name__ == "__main__":
