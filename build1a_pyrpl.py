@@ -317,6 +317,8 @@ def cmd_shell():
 
     def unlock():
         safe_outputs(rp)
+        rp.pid1.output_direct = 'off'; rp.pid1.i = 0.0; rp.pid1.p = 1.0; rp.pid1.ival = 0.0
+        rp.pid0.input = 'iq0'
         print("loop open")
 
     def sweep():
@@ -337,9 +339,9 @@ def cmd_shell():
         err, out = scope_curve(rp, duration=duration)
         a = LAST_FRINGE['ampl'] or float(np.max(np.abs(err)))
         e0 = err - np.mean(err)
-        # fringe crossings with hysteresis (Schmitt at +/-0.5 A): noise near zero no longer counts.
+        # fringe crossings with hysteresis (Schmitt at +/-0.85 A): a 0.2-0.4 rad residual never trips it.
         # one crossing = one fringe = FRINGE_HZ of laser tuning.
-        hi = e0 > 0.5 * a; lo = e0 < -0.5 * a
+        hi = e0 > 0.85 * a; lo = e0 < -0.85 * a
         state, nx = 0, 0
         for h, l in zip(hi, lo):
             if h and state != 1:
@@ -352,7 +354,7 @@ def cmd_shell():
         print(f"{duration*1e3:.0f} ms of error: RMS = {np.std(err):.4f}  mean = {np.mean(err):+.4f}  "
               f"peak = {np.max(np.abs(err)):.4f}  fringe A = {a:.4f}  residual = {np.std(err)/a:.2f} rad RMS  "
               f"samples beyond 0.7 A = {100*frac:.1f} %  -> {verdict}")
-        print(f"fringe hops (hysteresis +/-0.5 A): {nx}  -> {rate/1e3:.2f} kfringes/s  = {rate*FRINGE_HZ/1e6:.1f} MHz/s of frequency slew (if monotonic)")
+        print(f"fringe hops (hysteresis +/-0.85 A): {nx}  -> {rate/1e3:.2f} kfringes/s  = {rate*FRINGE_HZ/1e6:.1f} MHz/s of frequency slew (if monotonic)")
         # dominant spectral line of the error (an NCO/beat OFFSET shows as one tone carrying most of the power)
         X = np.abs(np.fft.rfft(e0 * np.hanning(len(e0)))) ** 2
         f = np.fft.rfftfreq(len(e0), d=duration / len(e0))
@@ -395,6 +397,81 @@ def cmd_shell():
         print(f"closed: P = {pid.p:g}  I = {pid.i:g} Hz")
         status()
 
+    def lead(fz_hz=6.6e3, ihz=None):
+        """PI lead: put the servo zero f_z = I/P at the laser's thermal FM corner (~6.6 kHz on the
+        PLANEX; FSUP 2026-10-21 put unity gain at 6.5 kHz with pure-I, i.e. the thermal pole was
+        eating the gain). P = I / f_z adds +45 deg at f_z and ~+68 deg at 16 kHz, cancelling the
+        pole: unity gain moves to ~15-18 kHz with ~45 deg margin; bump lands at 15-20 kHz.
+        Loop must already be closed (lock()). Watch the FSUP / SA while stepping f_z 10k -> 6.6k -> 4k."""
+        ih = pid.i if ihz is None else ihz
+        pg = ih / fz_hz
+        pid.p = pg; pid.i = ih
+        time.sleep(1.0)
+        print(f"PI zero at {fz_hz/1e3:.1f} kHz: P = {pg:.3g}  I = {ih:g} Hz   (flat-loop |L_P| ~ {pg*0.16/(LAST_FRINGE['ampl'] or 0.16)*1810:.2f} x A/0.16 at DC)")
+        status()
+
+    def pii(fz_hz=1.0e3, on=True):
+        """Second integrator for the low-frequency deficit (FSUP: 18 dB at 1 kHz, 45 dB at 100 Hz
+        with a single I). pid1 = (1 + fz/jf) sits between iq0 and pid0: unity above fz, extra
+        20 dB/decade below it, costs ~4 deg of phase at 16 kHz for fz = 1 kHz. Engage only on an
+        already-held lock; pid1 winds up like any integrator, so the slow loop keeps it centered.
+        pii(on=False) restores the single-I loop without opening it."""
+        p1 = rp.pid1
+        if on:
+            p1.input = 'iq0'; p1.setpoint = 0.0; p1.inputfilter = [0, 0, 0, 0]
+            p1.max_voltage = 1.0; p1.min_voltage = -1.0
+            p1.p = 1.0; p1.i = 0.0; p1.ival = 0.0; p1.output_direct = 'off'
+            pid.input = 'pid1'
+            time.sleep(0.3)
+            p1.i = fz_hz
+            print(f"PII on: second integrator corner {fz_hz/1e3:.2f} kHz (pid1 -> pid0)")
+        else:
+            pid.input = 'iq0'; p1.i = 0.0; p1.ival = 0.0
+            print("PII off: pid0 reads iq0 directly")
+        time.sleep(1.0); status()
+
+    def plant(fmin=1e3, fmax=300e3, points=60, amp=3e-4, save=None):
+        """Measure the actuator+discriminator response with the network analyzer while LOCKED:
+        a small sine (amp [V], 3e-4 V = 37 kHz pk = 0.37 fringe) is summed onto OUT1 and the
+        iq0 error read back. For f well above the loop crossover the ratio is the plant K(f)
+        [V_err / V_out1]; its magnitude roll-off and phase give the PLANEX thermal FM corner and
+        the total loop delay. Below crossover the loop suppresses it (that is the 1/(1+L) dip).
+        Saves CSV + plot. ~1-2 min."""
+        na = p.networkanalyzer
+        na.setup(start_freq=fmin, stop_freq=fmax, points=points, rbw=max(50.0, fmin/20),
+                 average_per_point=1, amplitude=amp, input='iq0', output_direct='out1',
+                 acbandwidth=0, logscale=True)
+        print("NA sweep running (loop stays closed)...")
+        tf = np.asarray(na.single())
+        f = np.asarray(na.frequencies)
+        na.output_direct = 'off'
+        mag = np.abs(tf) * 1.0; ph = np.unwrap(np.angle(tf)) * 180 / np.pi
+        ph -= ph[np.argmin(abs(f - 3e3))] - (ph[np.argmin(abs(f - 3e3))] % 360)  # display only
+        tag = save or f"plant_{time.strftime('%H%M%S')}"
+        np.savetxt(tag + ".csv", np.c_[f, mag, ph], delimiter=",", header="f_Hz,|T|_Verr_per_Vout1,phase_deg", comments="")
+        # single-pole fit above the loop crossover (f > 8 kHz): |T| = K0 / sqrt(1 + (f/fc)^2)
+        m = (f > 8e3) & np.isfinite(mag) & (mag > 0)
+        best = None
+        for fc in np.logspace(3, 5.5, 200):
+            K0 = np.exp(np.mean(np.log(mag[m] * np.sqrt(1 + (f[m] / fc) ** 2))))
+            err = np.sum((np.log(mag[m]) - np.log(K0 / np.sqrt(1 + (f[m] / fc) ** 2))) ** 2)
+            if best is None or err < best[0]: best = (err, fc, K0)
+        _, fc, K0 = best
+        print(f"plant fit (f > 8 kHz): K0 = {K0:.3g} V/V, thermal corner fc = {fc/1e3:.1f} kHz  "
+              f"(expected ~6-7 kHz). Compare |T| at 3 kHz = {mag[np.argmin(abs(f-3e3))]:.3g} (loop suppressed).")
+        try:
+            import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
+            fig, ax = plt.subplots(2, 1, figsize=(7, 5.5), sharex=True)
+            ax[0].loglog(f, mag, 'o-', ms=3, lw=0.8, label='Measured (Closed Loop)')
+            ax[0].loglog(f, K0 / np.sqrt(1 + (f / fc) ** 2), '--', c='0.4', label=f'Single-Pole Fit, $f_c$ = {fc/1e3:.1f} kHz')
+            ax[0].set_ylabel('|Error / OUT1| [V/V]'); ax[0].legend(fontsize=8); ax[0].grid(alpha=0.3, which='both')
+            ax[0].set_title('Plant Response: OUT1 Injection To IQ Error (Loop Closed)')
+            ax[1].semilogx(f, ph, 'o-', ms=3, lw=0.8, c='C1'); ax[1].set_ylabel('Phase [deg]'); ax[1].set_xlabel('Frequency [Hz]'); ax[1].grid(alpha=0.3, which='both')
+            fig.tight_layout(); fig.savefig(tag + ".png", dpi=150); plt.close(fig); print(f"saved {tag}.png / .csv")
+        except Exception as ex:
+            print(f"(no plot: {ex})")
+        return f, tf
+
     def seti(ihz):
         """change the integrator on the fly (loop stays closed). Capped at I_MAX_HZ: through the
         100:1 plant gain, I = 25 Hz is already a ~12 kHz crossover; 100 Hz hits the delay line's
@@ -422,7 +499,8 @@ def cmd_shell():
         -(ival - target)/gain, 70 % per period, clipped to +/-max_step ohm (2 ohm = 22 MHz, which the
         fast loop follows without a flicker; 10 ohm in one go dropped the lock on 2026-10-21).
         Opens the CTL200 serial port itself: exit the ctl200.py shell first. Ctrl-C to stop.
-        Bench drift 2026-10-21 was +0.17 V/min = ~2 ohm/min of correction."""
+        Bench drift 2026-10-21 was +0.17 V/min = ~2 ohm/min of correction.
+        With pii() on, OUT1 = pid0 output still carries the DC, so this loop needs no change."""
         import re as _re, serial
         ser = serial.Serial(port, 115200, timeout=0.3)
         def tx(cmdstr):
@@ -458,12 +536,12 @@ def cmd_shell():
         finally:
             print(f"slow loop stopped; rtset left at {r:.1f} ohm"); ser.close()
 
-    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  recenter()  errscope()  unlock()  slowloop('COM6')   "
+    banner = ("PyRPL shell.  status()  sweep()  lock()  lock(p, ihz)  seti(hz)  setp(p)  lead(fz)  pii(fz)  plant()  recenter()  errscope()  unlock()  slowloop('COM6')   "
               "rp/iq/pid are live objects.  Ctrl-Z Enter (Windows) or exit() to leave; the loop stays as you left it.\n"
               "Run sweep() once first so status() can report suppression [dB] against the fringe.")
     code.interact(banner=banner, local=dict(rp=rp, iq=iq, pid=pid, status=status, unlock=unlock, sweep=sweep,
                                              lock=lock, seti=seti, setp=setp, recenter=recenter, errscope=errscope,
-                                             slowloop=slowloop, np=np, time=time))
+                                             slowloop=slowloop, lead=lead, pii=pii, plant=plant, np=np, time=time))
 
 
 if __name__ == "__main__":
